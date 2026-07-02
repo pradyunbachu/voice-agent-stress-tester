@@ -111,17 +111,27 @@ def synthesize_stream(text: str, api_key: str):
 def take_complete_samples(buf: bytes) -> tuple[np.ndarray, bytes]:
     """Split a byte buffer into (complete int16 samples, leftover byte).
 
-    linear16 is 2 bytes/sample, but a network chunk can end mid-sample. We convert only the
-    largest even prefix and hand back any trailing odd byte, which the caller prepends to the
-    next chunk. That carry-over is why no sample is ever invented or misaligned. Pure, so it's
-    this pass's unit-tested core.
+    Each sample is 2 bytes, so bytes must be read in pairs: [A B][C D][E F]... But the
+    network splits chunks wherever it likes, so a chunk can end mid-pair — e.g. "A B C D E",
+    where E is only the FIRST half of a sample whose partner is in the NEXT chunk.
+
+    The rule: convert the whole pairs we have and put the lonely odd byte "in our pocket"
+    (return it as `leftover`) so the caller can glue it to the front of the next chunk. That
+    way E waits for its real partner instead of being paired with the wrong byte — which is
+    what would happen if we padded it, shifting and corrupting every sample after it.
+
+    Because linear16 audio is always an even number of bytes total, once the stream ends
+    `leftover` is empty: every byte eventually got paired with its true partner.
+
+    Pure (bytes in, arrays out — no network, no hardware), so it's this pass's unit-tested core.
 
     Returns:
         (samples, leftover): samples is a (frames, 1) int16 array; leftover is b"" or 1 byte.
     """
-    n_whole = len(buf) - (len(buf) % 2)                      # largest even byte count
+    n_whole = len(buf) - (len(buf) % 2)   # biggest EVEN count = the bytes we can safely pair up
+    # frombuffer reads those whole pairs back into int16 samples; reshape gives Rung 1's (N, 1).
     samples = np.frombuffer(buf[:n_whole], dtype=np.int16).reshape(-1, 1)
-    leftover = buf[n_whole:]                                 # the odd byte, if any
+    leftover = buf[n_whole:]              # the dangling half-sample byte (or b""), saved for next time
     return samples, leftover
 
 
@@ -132,7 +142,7 @@ def stream_and_play(text: str, api_key: str) -> np.ndarray:
     into. We also collect the chunks so the caller can save/inspect the whole clip afterward
     — that collection is just for parity with the batch pass, not part of the playback path.
     """
-    leftover = b""            # bytes carried over from a chunk that ended mid-sample
+    leftover = b""            # the "pocket": a half-sample byte held over from the last chunk
     collected: list[np.ndarray] = []
     first_ms = None
     start = time.perf_counter()
@@ -143,6 +153,8 @@ def stream_and_play(text: str, api_key: str) -> np.ndarray:
             if first_ms is None:  # measure time-to-first-audio: the whole reason to stream
                 first_ms = (time.perf_counter() - start) * 1000
                 print(f"First audio after {first_ms:.0f} ms")
+            # Glue any pocketed byte to the front of this chunk, then split back into whole
+            # samples + a new pocketed byte. leftover carries forward to the next loop.
             samples, leftover = take_complete_samples(leftover + chunk)
             stream.write(samples)      # feed the speaker immediately
             collected.append(samples)  # keep a copy so we can save/inspect later
