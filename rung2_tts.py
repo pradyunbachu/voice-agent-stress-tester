@@ -1,12 +1,16 @@
-"""Stage A, Rung 2 — TTS alone (Deepgram Aura), batch version.
+"""Stage A, Rung 2 — TTS alone (Deepgram Aura).
 
 Hand Deepgram some text, get back spoken audio as raw linear16 PCM, turn those bytes
 into the same int16 array from Rung 1, then save/inspect/play with Rung 1's functions.
 
-This file is being built one piece at a time. Piece 1 (here): load the API key safely.
+Two ways to receive the audio:
+  - batch:  synthesize()        — wait for the whole clip, then use it (pcm16_to_array).
+  - stream: synthesize_stream() — get chunks as they're made and play them immediately,
+            so the first sound comes out in ~tens of ms instead of after the whole clip.
 """
 
 import os
+import time
 from collections.abc import Mapping
 
 import numpy as np               # the int16 array Deepgram's bytes become
@@ -14,13 +18,17 @@ import requests                  # HTTP client: sends the request to Deepgram, r
 import sounddevice as sd         # play the result so your ears confirm it's speech
 from dotenv import load_dotenv  # reads a .env file's KEY=value lines into the environment
 
-# Reuse Rung 1: the one sample rate (so "ask Deepgram for" == "save_wav at"), plus the
-# functions that already know how to inspect/save the array.
-from rung1_audio import SAMPLE_RATE, inspect, save_wav
+# Reuse Rung 1: the audio format constants (so "ask Deepgram for" == "play/save at"), plus
+# the functions that already know how to inspect/save the array.
+from rung1_audio import CHANNELS, DTYPE, SAMPLE_RATE, inspect, save_wav
 
 # Deepgram's text-to-speech endpoint and the voice we want.
 DEEPGRAM_TTS_URL = "https://api.deepgram.com/v1/speak"
 TTS_MODEL = "aura-2-thalia-en"
+
+# Bytes to pull per network read while streaming. The carry-over buffer (take_complete_
+# samples) makes correctness independent of this size, so it's just a latency/throughput knob.
+CHUNK_SIZE = 4096
 
 
 def load_api_key(env: Mapping[str, str] | None = None) -> str:
@@ -82,21 +90,87 @@ def pcm16_to_array(raw: bytes) -> np.ndarray:
     return samples.reshape(-1, 1)                 # flat (N,) -> mono (N, 1)
 
 
-# End-to-end demo: text -> Deepgram -> bytes -> array -> inspect/save/play (the last three
-# are Rung 1, fed by a brand-new source). Your ears + the stats confirm it's real speech.
+def synthesize_stream(text: str, api_key: str):
+    """Yield linear16 audio in chunks as Deepgram synthesizes it (a generator).
+
+    Same request as synthesize(), but stream=True tells requests not to download the whole
+    body first — iter_content hands us pieces as they arrive, so playback can start before
+    the clip is finished. Network-touching, so verified by a live run, not a unit test.
+    """
+    params = {"model": TTS_MODEL, "encoding": "linear16", "sample_rate": SAMPLE_RATE}
+    headers = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
+    # `with` closes the connection even if playback errors out mid-stream.
+    with requests.post(DEEPGRAM_TTS_URL, params=params, headers=headers,
+                       json={"text": text}, stream=True) as response:
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:            # iter_content can emit empty keep-alive chunks; skip them
+                yield chunk
+
+
+def take_complete_samples(buf: bytes) -> tuple[np.ndarray, bytes]:
+    """Split a byte buffer into (complete int16 samples, leftover byte).
+
+    Each sample is 2 bytes, so bytes must be read in pairs: [A B][C D][E F]... But the
+    network splits chunks wherever it likes, so a chunk can end mid-pair — e.g. "A B C D E",
+    where E is only the FIRST half of a sample whose partner is in the NEXT chunk.
+
+    The rule: convert the whole pairs we have and put the lonely odd byte "in our pocket"
+    (return it as `leftover`) so the caller can glue it to the front of the next chunk. That
+    way E waits for its real partner instead of being paired with the wrong byte — which is
+    what would happen if we padded it, shifting and corrupting every sample after it.
+
+    Because linear16 audio is always an even number of bytes total, once the stream ends
+    `leftover` is empty: every byte eventually got paired with its true partner.
+
+    Pure (bytes in, arrays out — no network, no hardware), so it's this pass's unit-tested core.
+
+    Returns:
+        (samples, leftover): samples is a (frames, 1) int16 array; leftover is b"" or 1 byte.
+    """
+    n_whole = len(buf) - (len(buf) % 2)   # biggest EVEN count = the bytes we can safely pair up
+    # frombuffer reads those whole pairs back into int16 samples; reshape gives Rung 1's (N, 1).
+    samples = np.frombuffer(buf[:n_whole], dtype=np.int16).reshape(-1, 1)
+    leftover = buf[n_whole:]              # the dangling half-sample byte (or b""), saved for next time
+    return samples, leftover
+
+
+def stream_and_play(text: str, api_key: str) -> np.ndarray:
+    """Stream audio from Deepgram and play each chunk as it arrives; return the full array.
+
+    Live playback (the point of streaming) goes through a persistent OutputStream we write()
+    into. We also collect the chunks so the caller can save/inspect the whole clip afterward
+    — that collection is just for parity with the batch pass, not part of the playback path.
+    """
+    leftover = b""            # the "pocket": a half-sample byte held over from the last chunk
+    collected: list[np.ndarray] = []
+    first_ms = None
+    start = time.perf_counter()
+
+    # OutputStream keeps the speaker open across many small writes (vs sd.play's one-shot).
+    with sd.OutputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE) as stream:
+        for chunk in synthesize_stream(text, api_key):
+            if first_ms is None:  # measure time-to-first-audio: the whole reason to stream
+                first_ms = (time.perf_counter() - start) * 1000
+                print(f"First audio after {first_ms:.0f} ms")
+            # Glue any pocketed byte to the front of this chunk, then split back into whole
+            # samples + a new pocketed byte. leftover carries forward to the next loop.
+            samples, leftover = take_complete_samples(leftover + chunk)
+            stream.write(samples)      # feed the speaker immediately
+            collected.append(samples)  # keep a copy so we can save/inspect later
+
+    return np.concatenate(collected) if collected else np.empty((0, 1), dtype=np.int16)
+
+
+# Streaming demo: play Deepgram's speech as it arrives, then save/inspect the assembled clip
+# with Rung 1's functions (same array, just delivered live instead of all at once).
 if __name__ == "__main__":
     key = load_api_key()
     print(f"DEEPGRAM_API_KEY loaded ({len(key)} chars)")
 
-    audio_bytes = synthesize("Welcome to Tony's Pizza. What can I get started for you?", key)
-    print(f"Got {len(audio_bytes)} bytes of linear16 audio from Deepgram.")
+    print("Streaming from Deepgram...")
+    audio = stream_and_play("Welcome to Tony's Pizza. What can I get started for you?", key)
 
-    audio = pcm16_to_array(audio_bytes)
-    inspect(audio, "tts")                  # same stats line as Rung 1: shape/dtype/min/max
+    inspect(audio, "tts-stream")           # same stats line as Rung 1: shape/dtype/min/max
     save_wav(audio, "tts_output.wav", SAMPLE_RATE)
-    print("Saved tts_output.wav")
-
-    print("Playing back...")
-    sd.play(audio, SAMPLE_RATE)
-    sd.wait()
-    print("Done.")
+    print("Saved tts_output.wav. Done.")
