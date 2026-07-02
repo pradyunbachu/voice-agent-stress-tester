@@ -1,15 +1,15 @@
-"""Unit tests for Rung 2, piece 1 — the key loader.
+"""Unit tests for Rung 2 — the pure, network-free parts.
 
-We test load_api_key() by passing a fake env dict, so these tests need no real key,
-no .env file, and never touch the network. (The default path that reads the real
-environment is the untestable I/O part, like record() in Rung 1 — we don't test it.)
+We test the key loader (via a fake env dict), the batch bytes->array conversion, and the
+streaming carry-over buffer. None of these need a real key or the network; the parts that
+do (synthesize / synthesize_stream / stream_and_play) are verified by a live run instead.
 """
 
 import numpy as np
 import pytest
 
 from rung1_audio import SAMPLE_RATE, load_wav, save_wav
-from rung2_tts import load_api_key, pcm16_to_array
+from rung2_tts import load_api_key, pcm16_to_array, take_complete_samples
 
 
 def test_returns_key_when_present():
@@ -73,3 +73,56 @@ def test_pcm16_to_array_output_round_trips_through_wav(tmp_path):
     # Assert: samples and rate survive the trip.
     assert np.array_equal(reloaded.reshape(-1), expected)
     assert sr == SAMPLE_RATE
+
+
+def test_take_complete_samples_even_buffer_has_no_leftover():
+    """An even byte count is all whole samples: everything converts, nothing carries over."""
+    expected = np.array([100, -100, 32767], dtype=np.int16)  # 6 bytes, 3 samples
+    samples, leftover = take_complete_samples(expected.tobytes())
+
+    assert leftover == b""
+    assert samples.shape == (3, 1)
+    assert np.array_equal(samples.reshape(-1), expected)
+
+
+def test_take_complete_samples_odd_buffer_keeps_trailing_byte():
+    """An odd byte count converts the whole prefix and hands back exactly the last byte."""
+    # 4 bytes (2 samples) + 1 stray byte = 5 bytes.
+    two_samples = np.array([1234, 5678], dtype=np.int16).tobytes()
+    buf = two_samples + b"\xAB"
+
+    samples, leftover = take_complete_samples(buf)
+
+    assert samples.shape == (2, 1)                     # only the 2 whole samples came out
+    assert np.array_equal(samples.reshape(-1), np.array([1234, 5678], dtype=np.int16))
+    assert leftover == b"\xAB"                          # the stray byte is preserved, not dropped
+
+
+def test_take_complete_samples_carry_over_reconstructs_split_sample():
+    """The whole point: a sample split across two chunks must reassemble exactly.
+
+    We slice a known 2-sample stream at an ODD offset so the second sample is torn in half,
+    then feed the pieces the way stream_and_play does (leftover + next chunk)."""
+    expected = np.array([0x1234, 0x5678], dtype=np.int16)
+    stream = expected.tobytes()                        # 4 bytes total
+    chunk1, chunk2 = stream[:3], stream[3:]            # 3 bytes then 1 byte — splits sample 2
+
+    # First chunk: one whole sample out, one byte held back.
+    s1, leftover = take_complete_samples(chunk1)
+    assert s1.shape == (1, 1)
+    assert leftover == stream[2:3]
+
+    # Second chunk: prepend the leftover, and the torn sample comes back whole.
+    s2, leftover = take_complete_samples(leftover + chunk2)
+    assert leftover == b""
+
+    # Reassembled stream equals the original — no invented or misaligned samples.
+    combined = np.concatenate([s1, s2]).reshape(-1)
+    assert np.array_equal(combined, expected)
+
+
+def test_take_complete_samples_empty_buffer():
+    """No bytes -> no samples, no leftover — the safe base case for the very first chunk."""
+    samples, leftover = take_complete_samples(b"")
+    assert samples.shape == (0, 1)
+    assert leftover == b""
