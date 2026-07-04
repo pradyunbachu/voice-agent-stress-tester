@@ -5,7 +5,7 @@ tests need no key, no audio, and no network. The transcribe() call that actually
 is the untestable I/O part (like synthesize() in Rung 2) — verified by a live run instead.
 """
 
-from rung3_stt import extract_transcript
+from rung3_stt import extract_transcript, parse_stt_message
 
 
 def _response(transcript: str) -> dict:
@@ -40,3 +40,50 @@ def test_transcript_field_missing_returns_empty_string():
     """An alternative with no transcript field defaults to "" rather than KeyError."""
     response = {"results": {"channels": [{"alternatives": [{"confidence": 0.9}]}]}}
     assert extract_transcript(response) == ""
+
+
+# --- streaming message parser (parse_stt_message) ---
+
+def _stream_msg(transcript: str, is_final: bool, speech_final: bool) -> dict:
+    """Build a minimal Deepgram *streaming* message (note: channel is singular here)."""
+    return {
+        "channel": {"alternatives": [{"transcript": transcript}]},
+        "is_final": is_final,
+        "speech_final": speech_final,
+    }
+
+
+def test_parse_interim_message():
+    """An interim guess: text present, is_final False (may still change)."""
+    result = parse_stt_message(_stream_msg("welcome to", is_final=False, speech_final=False))
+    assert result.text == "welcome to"
+    assert result.is_final is False
+    assert result.speech_final is False
+
+
+def test_parse_final_message():
+    """A settled span: same text but is_final True."""
+    result = parse_stt_message(_stream_msg("welcome to tony's", is_final=True, speech_final=False))
+    assert result.text == "welcome to tony's"
+    assert result.is_final is True
+
+
+def test_parse_endpoint_message():
+    """speech_final True is the endpointing signal — the speaker paused/stopped."""
+    result = parse_stt_message(_stream_msg("welcome to tony's pizza", is_final=True, speech_final=True))
+    assert result.speech_final is True
+
+
+def test_parse_non_transcript_message_has_empty_text():
+    """Metadata/keep-alive messages have no channel: text is "", flags default to False."""
+    result = parse_stt_message({"type": "Metadata"})
+    assert result.text == ""
+    assert result.is_final is False
+    assert result.speech_final is False
+
+
+def test_parse_empty_alternatives_has_empty_text():
+    """A Results message with an empty alternatives list yields "" text, not an IndexError."""
+    result = parse_stt_message({"channel": {"alternatives": []}, "is_final": True})
+    assert result.text == ""
+    assert result.is_final is True
